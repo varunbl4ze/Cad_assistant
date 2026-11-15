@@ -2,15 +2,11 @@
 chat_panel.py - the sidebar UI: the chat widget and the code that docks it
 into FreeCAD's main window.
 
-Commands you can type in the chat:
-    /box <length> <width> <height>   create a box (millimetres)
-    /cylinder <radius> <height>      create a cylinder
-    /sphere <radius>                 create a sphere
-    /list                            list the objects in the active document
-    /move <name> <x> <y> <z>         move an object to a position (mm)
-    /delete <name>                   delete an object
-    /url [address]                   show or change the backend URL
-    /help                            list the commands
+Two ways to use it:
+  1. Commands:      /box 50 20 10   /cylinder 10 30   /sphere 15   /list
+                    /move <name> <x> <y> <z>   /delete <name>   /url [address]   /help
+  2. Plain English: "make a 40 mm cube and a sphere of radius 20"
+     The backend proposes a PLAN. Nothing changes until you press Approve.
 """
 
 import html
@@ -56,8 +52,12 @@ QPushButton {
     border: 1px solid %(BORDER)s; border-radius: 6px; padding: 5px 10px;
 }
 QPushButton:hover { background-color: #3a3a37; }
-QPushButton#send { background-color: %(ACCENT)s; border: none; color: white; font-weight: 600; }
-QPushButton#send:hover { background-color: #c8664a; }
+QPushButton:disabled { color: %(MUTED)s; }
+QPushButton#send, QPushButton#approve {
+    background-color: %(ACCENT)s; border: none; color: white; font-weight: 600;
+}
+QPushButton#send:hover, QPushButton#approve:hover { background-color: #c8664a; }
+QPushButton#send:disabled, QPushButton#approve:disabled { background-color: %(BORDER)s; }
 QTextBrowser#chat { background-color: %(BG)s; color: %(TEXT)s; border: none; }
 QLineEdit {
     background-color: %(SURFACE)s; color: %(TEXT)s;
@@ -67,11 +67,15 @@ QLineEdit:focus { border: 1px solid %(ACCENT)s; }
 """ % dict(BG=BG, SURFACE=SURFACE, BORDER=BORDER, TEXT=TEXT, MUTED=MUTED, ACCENT=ACCENT)
 
 WELCOME = (
-    "Hi, I'm the CAD Assistant. This is an early version and I don't use AI yet.\n"
-    "Try: /box 50 20 10   (length width height, in mm)\n"
-    "Type /help to see all commands."
+    "Hi, I'm the CAD Assistant. No AI model is connected yet; a simple built-in planner "
+    "understands a few phrases.\n"
+    "Try: make a 40 mm cube and a sphere of radius 20\n"
+    "Or use a command like /box 50 20 10. Type /help for everything."
 )
 HELP = (
+    "Describe what you want, for example:\n"
+    "make a 40 mm cube and a sphere of radius 20\n"
+    "I'll propose a plan, and nothing happens until you press Approve.\n\n"
     "Commands (sizes in mm, all greater than 0):\n"
     "/box <length> <width> <height>\n"
     "/cylinder <radius> <height>\n"
@@ -87,10 +91,6 @@ USAGE_CYLINDER = "Usage: /cylinder <radius> <height>\nExample: /cylinder 10 30  
 USAGE_SPHERE = "Usage: /sphere <radius>\nExample: /sphere 15  (mm, greater than 0)"
 USAGE_MOVE = "Usage: /move <name> <x> <y> <z>\nExample: /move Cylinder 100 0 0  (mm, can be negative; see /list for names)"
 USAGE_DELETE = "Usage: /delete <name>\nExample: /delete Box  (see /list for names)"
-PLACEHOLDER_REPLY = (
-    "This is a placeholder reply, since AI responses are not added yet. "
-    "Type /help to see the commands that work now."
-)
 
 
 class ChatPanel(QtWidgets.QWidget):
@@ -104,6 +104,15 @@ class ChatPanel(QtWidgets.QWidget):
         self._connected = None  # None = not checked yet, True = online, False = offline
         self._last_message = ""
         self._checking = False
+
+        # Plan state: a plan waits for approval in _pending_steps; once approved
+        # its steps run one at a time from _active_steps.
+        self._plan_request_id = 0   # lets us ignore a plan that arrives after a newer message
+        self._pending_steps = []
+        self._active_steps = []
+        self._plan_running = False
+        self._plan_total = 0
+        self._plan_done = 0
 
         # Background threads put their results in this queue; a timer on the
         # UI thread picks them up. (Only the UI thread may touch widgets.)
@@ -150,6 +159,22 @@ class ChatPanel(QtWidgets.QWidget):
         self.chat.setObjectName("chat")
         layout.addWidget(self.chat, 1)  # stretch = 1: takes all spare space
 
+        # Approval bar: only visible while a plan is waiting for a decision
+        self.plan_bar = QtWidgets.QFrame()
+        bar = QtWidgets.QHBoxLayout(self.plan_bar)
+        bar.setContentsMargins(0, 0, 0, 0)
+        bar.addWidget(QtWidgets.QLabel("Run this plan?"))
+        bar.addStretch()
+        self.cancel_button = QtWidgets.QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self._cancel_plan)
+        bar.addWidget(self.cancel_button)
+        self.approve_button = QtWidgets.QPushButton("Approve")
+        self.approve_button.setObjectName("approve")
+        self.approve_button.clicked.connect(self._approve_plan)
+        bar.addWidget(self.approve_button)
+        self.plan_bar.setVisible(False)
+        layout.addWidget(self.plan_bar)
+
         # Input row: text field + Send button
         bottom = QtWidgets.QHBoxLayout()
         self.input = QtWidgets.QLineEdit()
@@ -187,6 +212,7 @@ class ChatPanel(QtWidgets.QWidget):
         self._add_message("CAD Assistant", WELCOME)
 
     def new_chat(self):
+        self._cancel_plan(announce=False)
         self.chat.clear()
         self._show_welcome()
         self.check_backend()
@@ -199,15 +225,15 @@ class ChatPanel(QtWidgets.QWidget):
         self.input.clear()
 
         self._add_message("You", text, "user")
+        self._cancel_plan(announce=True)  # a plan still waiting for approval is dropped
 
         if text.startswith("/"):
             self._handle_command(text)
             return
 
-        self._add_message("CAD Assistant", PLACEHOLDER_REPLY)
-        if self._connected is False:  # only mention the backend if we know it is down
-            self._add_message("CAD Assistant", "Backend not connected. " + self._last_message, "error")
-        self.check_backend()  # refresh the indicator
+        # Plain English: ask the backend for a plan. It proposes; it runs nothing.
+        self._plan_request_id += 1
+        self._run_backend_plan(text, cad_actions.get_context(), self._plan_request_id)
 
     # ---------- commands typed like /box 50 20 10 ----------
 
@@ -312,6 +338,97 @@ class ChatPanel(QtWidgets.QWidget):
         self._set_status("checking")
         self.check_backend()
 
+    # ---------- plans: propose, approve, run ----------
+
+    def _run_backend_plan(self, message, context, request_id):
+        url = backend_client.get_backend_url()
+        threading.Thread(
+            target=self._run_plan_request, args=(url, message, context, request_id), daemon=True
+        ).start()
+
+    def _run_plan_request(self, url, message, context, request_id):
+        """Background thread: ask the backend for a plan."""
+        result = backend_client.plan(url, message, context)
+        result["request_id"] = request_id
+        self._results.put(("plan", result))
+
+    def _on_plan_done(self, result):
+        """UI thread: show the proposed plan and wait for the person's decision."""
+        if result.get("request_id") != self._plan_request_id:
+            return  # an older request; a newer message has replaced it
+        if not result["ok"]:
+            self._add_message("CAD Assistant", result["message"], "error")
+            return
+
+        plan = result["result"]
+        steps = plan.get("steps", []) if isinstance(plan, dict) else []
+        if not isinstance(steps, list) or not all(isinstance(s, dict) for s in steps):
+            self._add_message("CAD Assistant", "The backend returned a plan I can't read.", "error")
+            return
+
+        reply = str(plan.get("reply", ""))
+        if reply:
+            self._add_message("CAD Assistant", reply)
+        if not steps:
+            return
+
+        self._pending_steps = steps
+        lines = ["%d. %s" % (n, cad_actions.describe_step(s)) for n, s in enumerate(steps, start=1)]
+        self._add_message("CAD Assistant", "Proposed plan:\n" + "\n".join(lines))
+        self.plan_bar.setVisible(True)
+
+    def _cancel_plan(self, announce=True):
+        """Drop a plan that is waiting for approval."""
+        had_plan = bool(self._pending_steps)
+        self._pending_steps = []
+        self.plan_bar.setVisible(False)
+        self._plan_request_id += 1  # also ignore a plan that is still on its way
+        if had_plan and announce:
+            self._add_message("CAD Assistant", "Plan cancelled.")
+
+    def _approve_plan(self):
+        if not self._pending_steps:
+            return
+        self._active_steps = list(self._pending_steps)
+        self._plan_total = len(self._active_steps)
+        self._plan_done = 0
+        self._pending_steps = []
+        self.plan_bar.setVisible(False)
+        self._plan_running = True
+        self._set_busy(True)  # no typing or buttons while the steps run
+        self._next_step()
+
+    def _next_step(self):
+        if not self._active_steps:
+            self._add_message("CAD Assistant", "Plan finished (%d of %d steps done)." % (self._plan_done, self._plan_total))
+            self._finish_plan()
+            return
+        step = self._active_steps.pop(0)
+        # Each step goes through the same backend checks as a typed command.
+        self._run_backend_command(step.get("command"), step.get("parameters", {}))
+
+    def _continue_plan(self, step_ok):
+        if step_ok:
+            self._plan_done += 1
+            self._next_step()
+        else:
+            self._add_message(
+                "CAD Assistant",
+                "Plan stopped at step %d of %d. The remaining steps were not run." % (self._plan_done + 1, self._plan_total),
+                "error",
+            )
+            self._finish_plan()
+
+    def _finish_plan(self):
+        self._plan_running = False
+        self._active_steps = []
+        self._set_busy(False)
+        self.input.setFocus()
+
+    def _set_busy(self, busy):
+        for widget in (self.input, self.send_button, self.new_chat_button, self.approve_button, self.cancel_button):
+            widget.setEnabled(not busy)
+
     # ---------- talking to the backend (never blocks the UI) ----------
 
     def _run_backend_command(self, command, parameters):
@@ -326,19 +443,25 @@ class ChatPanel(QtWidgets.QWidget):
         self._results.put(("execute", result))
 
     def _on_execute_done(self, result):
+        ok = self._handle_execute_result(result)
+        if self._plan_running:
+            self._continue_plan(ok)
+
+    def _handle_execute_result(self, result):
         """UI thread: the backend answered. Now (and only now) change the FreeCAD document."""
         if not result["ok"]:
             self._add_message("CAD Assistant", result["message"], "error")
-            return
+            return False
         try:
             message = cad_actions.run_action(result["result"])
         except ValueError as error:  # an ordinary problem, e.g. "No object named 'Cone'": just say it
             self._add_message("CAD Assistant", str(error), "error")
-            return
+            return False
         except Exception as error:  # anything unexpected; never let it crash FreeCAD's UI
             self._add_message("CAD Assistant", "Could not run the action in FreeCAD: %s" % error, "error")
-            return
+            return False
         self._add_message("CAD Assistant", message)
+        return True
 
     def check_backend(self):
         if self._checking:
@@ -372,10 +495,14 @@ class ChatPanel(QtWidgets.QWidget):
             try:
                 if kind == "check":
                     self._on_check_done(result)
+                elif kind == "plan":
+                    self._on_plan_done(result)
                 else:
                     self._on_execute_done(result)
             except Exception as error:  # show problems in the chat instead of hiding them
                 self._add_message("CAD Assistant", "Internal error: %s" % error, "error")
+                if self._plan_running:
+                    self._finish_plan()  # never leave the panel stuck disabled
 
     def _set_status(self, state, url=""):
         address = url.split("://", 1)[-1]  # "http://127.0.0.1:8000" -> "127.0.0.1:8000"

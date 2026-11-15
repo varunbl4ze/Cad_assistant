@@ -80,12 +80,12 @@ def check_health(base_url, timeout=3):
         return {"ok": False, "message": "Backend check failed: %s" % error}
 
 
-def execute_command(base_url, command, parameters, timeout=5):
+def _post(base_url, path, payload, timeout):
     """
-    Call POST <base_url>/execute, which your backend's router handles.
+    POST JSON to the backend and unwrap its {"success": true, "result": ...} answer.
 
     Always returns a dict and never raises:
-        {"ok": True,  "result": {...whatever the backend returned...}}
+        {"ok": True,  "result": {...}}
         {"ok": False, "message": "<human-readable reason>"}
     """
     problem = url_problem(base_url)
@@ -93,8 +93,8 @@ def execute_command(base_url, command, parameters, timeout=5):
         return {"ok": False, "message": problem}
 
     request = urllib.request.Request(
-        base_url + "/execute",
-        data=json.dumps({"command": command, "parameters": parameters}).encode("utf-8"),
+        base_url + path,
+        data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -112,6 +112,12 @@ def execute_command(base_url, command, parameters, timeout=5):
             detail = json.loads(error.read().decode("utf-8")).get("detail", "")
         except Exception:
             pass
+        if error.code == 404 and str(detail) in ("", "Not Found"):
+            return {
+                "ok": False,
+                "message": "The backend has no %s endpoint. It is probably running an older main.py: "
+                "update it and restart uvicorn (see /docs in a browser for what it serves)." % path,
+            }
         return {"ok": False, "message": str(detail) or "Backend returned HTTP %s" % error.code}
     except urllib.error.URLError as error:
         return {
@@ -120,3 +126,16 @@ def execute_command(base_url, command, parameters, timeout=5):
         }
     except Exception as error:
         return {"ok": False, "message": "Backend request failed: %s" % error}
+
+
+def execute_command(base_url, command, parameters, timeout=5):
+    """Ask the backend to validate and describe one command (POST /execute)."""
+    return _post(base_url, "/execute", {"command": command, "parameters": parameters}, timeout)
+
+
+def plan(base_url, message, context, history=None, timeout=300):
+    """
+    Ask the backend for a plan (POST /plan). It proposes steps and runs nothing.
+    The timeout is long because a local model can take a while, especially on its first request.
+    """
+    return _post(base_url, "/plan", {"message": message, "context": context, "history": history or []}, timeout)

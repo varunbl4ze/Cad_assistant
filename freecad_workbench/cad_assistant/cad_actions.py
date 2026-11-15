@@ -106,10 +106,29 @@ def _find_object(name):
     return doc, obj
 
 
-def _make_part(type_id, label, properties, undo_text):
+def _read_position(position):
+    """Return None if there is no position, otherwise a checked (x, y, z) tuple."""
+    if position is None:
+        return None
+    try:
+        x, y, z = (float(position[k]) for k in ("x", "y", "z"))
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("Backend returned an invalid position.")
+    if not all(math.isfinite(v) and abs(v) <= MAX_COORDINATE for v in (x, y, z)):
+        raise ValueError("Position values are out of range.")
+    return (x, y, z)
+
+
+def _at(position):
+    """Text for a message: " at (60, 0, 0)", or nothing if the object was left at the origin."""
+    return "" if position is None else " at (%g, %g, %g)" % position
+
+
+def _make_part(type_id, label, properties, undo_text, position=None):
     """
     Create one Part primitive (box, cylinder, ...) inside a transaction and return it.
     `properties` is built by our own code (never from the user), e.g. {"Radius": 10.0}.
+    `position` is an optional (x, y, z) in mm; without it the object starts at the origin.
     """
     # Imported here (not at the top) so this file can be read outside FreeCAD.
     import FreeCAD
@@ -121,6 +140,8 @@ def _make_part(type_id, label, properties, undo_text):
         obj = doc.addObject(type_id, label)
         for name, value in properties.items():
             setattr(obj, name, value)  # FreeCAD lengths are in millimetres
+        if position is not None:
+            obj.Placement = FreeCAD.Placement(FreeCAD.Vector(*position), obj.Placement.Rotation)
         doc.recompute()
     _fit_view()
     return obj
@@ -130,32 +151,35 @@ def _make_part(type_id, label, properties, undo_text):
 
 def _create_box(action):
     length, width, height = _positive_numbers(action.get("dimensions", {}), ("length", "width", "height"))
+    position = _read_position(action.get("position"))
     box = _make_part(
         "Part::Box", "Box",
         {"Length": length, "Width": width, "Height": height},
-        "CAD Assistant: Create Box",
+        "CAD Assistant: Create Box", position,
     )
-    return "Created %s (%g x %g x %g mm). Press Ctrl+Z to undo." % (box.Label, length, width, height)
+    return "Created %s (%g x %g x %g mm)%s. Press Ctrl+Z to undo." % (box.Label, length, width, height, _at(position))
 
 
 def _create_cylinder(action):
     radius, height = _positive_numbers(action.get("dimensions", {}), ("radius", "height"))
+    position = _read_position(action.get("position"))
     cylinder = _make_part(
         "Part::Cylinder", "Cylinder",
         {"Radius": radius, "Height": height},
-        "CAD Assistant: Create Cylinder",
+        "CAD Assistant: Create Cylinder", position,
     )
-    return "Created %s (radius %g, height %g mm). Press Ctrl+Z to undo." % (cylinder.Label, radius, height)
+    return "Created %s (radius %g, height %g mm)%s. Press Ctrl+Z to undo." % (cylinder.Label, radius, height, _at(position))
 
 
 def _create_sphere(action):
     (radius,) = _positive_numbers(action.get("dimensions", {}), ("radius",))
+    position = _read_position(action.get("position"))
     sphere = _make_part(
         "Part::Sphere", "Sphere",
         {"Radius": radius},
-        "CAD Assistant: Create Sphere",
+        "CAD Assistant: Create Sphere", position,
     )
-    return "Created %s (radius %g mm). Press Ctrl+Z to undo." % (sphere.Label, radius)
+    return "Created %s (radius %g mm)%s. Press Ctrl+Z to undo." % (sphere.Label, radius, _at(position))
 
 
 def _move_object(action):
@@ -224,3 +248,62 @@ def _list_objects(action):
     if extra > 0:
         lines.append("...and %d more" % extra)
     return "Objects in %s (%d):\n%s" % (doc.Label, len(doc.Objects), "\n".join(lines))
+
+
+# ---------- information for the planner and for the approval card ----------
+
+def get_context():
+    """
+    A small read-only summary of the active document, sent to the planner so it knows
+    what exists. Changes nothing. Returns a list of dicts (empty if nothing is open).
+    """
+    import FreeCAD
+
+    doc = FreeCAD.ActiveDocument
+    if doc is None:
+        return []
+
+    context = []
+    for obj in doc.Objects[:MAX_LISTED]:
+        item = {"label": obj.Label, "type": obj.TypeId}
+        try:
+            if obj.TypeId == "Part::Box":
+                item["size"] = {"length": obj.Length.Value, "width": obj.Width.Value, "height": obj.Height.Value}
+            elif obj.TypeId == "Part::Cylinder":
+                item["size"] = {"radius": obj.Radius.Value, "height": obj.Height.Value}
+            elif obj.TypeId == "Part::Sphere":
+                item["size"] = {"radius": obj.Radius.Value}
+            if "size" in item:
+                base = obj.Placement.Base
+                item["position"] = {"x": base.x, "y": base.y, "z": base.z}
+        except Exception:
+            pass  # a summary is optional; skip details for an odd object
+        context.append(item)
+    return context
+
+
+def _g(value):
+    return "%g" % float(value)
+
+
+def describe_step(step):
+    """One readable line for a proposed step, shown to the person before they approve."""
+    command = step.get("command")
+    p = step.get("parameters", {})
+    try:
+        where = ""
+        if any(k in p for k in ("x", "y", "z")):
+            where = " at (%s, %s, %s)" % (_g(p.get("x", 0)), _g(p.get("y", 0)), _g(p.get("z", 0)))
+        if command == "create_box":
+            return "Create a box %s x %s x %s mm%s" % (_g(p["length"]), _g(p["width"]), _g(p["height"]), where)
+        if command == "create_cylinder":
+            return "Create a cylinder (radius %s, height %s mm)%s" % (_g(p["radius"]), _g(p["height"]), where)
+        if command == "create_sphere":
+            return "Create a sphere (radius %s mm)%s" % (_g(p["radius"]), where)
+        if command == "move_object":
+            return "Move %s to (%s, %s, %s) mm" % (p["name"], _g(p["x"]), _g(p["y"]), _g(p["z"]))
+        if command == "delete_object":
+            return "Delete %s" % p["name"]
+    except (KeyError, TypeError, ValueError):
+        pass
+    return "Run %s" % command
